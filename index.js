@@ -7,7 +7,7 @@ import {
     EndBehaviorType, 
     getVoiceConnection 
 } from '@discordjs/voice';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import * as googleTTS from 'google-tts-api';
 import prism from 'prism-media';
 import fs from 'fs';
@@ -15,7 +15,7 @@ import path from 'path';
 import http from 'http';
 import 'dotenv/config';
 
-// --- 1. Renderスリープ防止Webサーバー ---
+// --- 1. Webサーバー (Renderスリープ防止用) ---
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -34,13 +34,13 @@ const client = new Client({
     ]
 });
 
-// Gemini SDKの初期化（環境変数 GEMINI_API_KEY を自動参照）
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Gemini 初期化
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const player = createAudioPlayer();
 
 const TEMP_USER_AUDIO = path.resolve('./temp_user.wav');
 
-// --- 3. コマンド定義 ---
+// --- 3. スラッシュコマンド登録 ---
 const commands = [
     new SlashCommandBuilder().setName('join').setDescription('VCに参加してGemini AIと会話を開始します'),
     new SlashCommandBuilder().setName('leave').setDescription('VCから退室します')
@@ -103,7 +103,6 @@ function setupSpeechRecognition(connection) {
     receiver.speaking.on('start', (userId) => {
         if (player.state.status === AudioPlayerStatus.Playing) return;
 
-        // 0.8秒間無音が続いたら発話終了と判定
         const opusStream = receiver.subscribe(userId, {
             end: {
                 behavior: EndBehaviorType.AfterSilence,
@@ -122,37 +121,31 @@ function setupSpeechRecognition(connection) {
     });
 }
 
-// --- 6. Gemini API 音声理解 ➔ テキスト生成 ➔ 音声読み上げ ---
+// --- 6. Gemini 思考 ➔ 音声再生 ---
 async function processGeminiAIResponse() {
     try {
         if (!fs.existsSync(TEMP_USER_AUDIO) || fs.statSync(TEMP_USER_AUDIO).size < 2000) return;
 
-        // 録音した音声ファイルを Base64 に変換
         const audioBuffer = fs.readFileSync(TEMP_USER_AUDIO);
         const base64Audio = audioBuffer.toString('base64');
 
-        // Gemini 2.5 Flash に直接音声を渡して回答を得る
-        const response = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: [
-                {
-                    inlineData: {
-                        mimeType: 'audio/wav',
-                        data: base64Audio
-                    }
-                },
-                {
-                    text: 'あなたはDiscordのボイスチャットで話すフレンドリーなAIです。相手の音声を聞き取り、日本語で短く簡潔に（1〜2文程度で）自然に返答してください。'
-                }
-            ]
-        });
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
-        const aiText = response.text ? response.text.trim() : '';
+        const response = await model.generateContent([
+            {
+                inlineData: {
+                    mimeType: 'audio/wav',
+                    data: base64Audio
+                }
+            },
+            'あなたはDiscordのボイスチャットで話すフレンドリーなAIです。相手の音声を聞き取り、日本語で短く簡潔に（1〜2文程度で）自然に返答してください。'
+        ]);
+
+        const aiText = response.response.text().trim();
         if (!aiText) return;
 
         console.log(`🤖 Gemini: "${aiText}"`);
 
-        // Google TTS でテキストを音声URL（MP3）に変換
         const ttsUrl = googleTTS.getAudioUrl(aiText, {
             lang: 'ja',
             slow: false,
@@ -160,7 +153,6 @@ async function processGeminiAIResponse() {
             timeout: 10000,
         });
 
-        // ボイスチャンネルで再生
         const resource = createAudioResource(ttsUrl);
         player.play(resource);
 
