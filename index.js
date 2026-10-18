@@ -34,13 +34,12 @@ const client = new Client({
     ]
 });
 
-// Gemini 初期化
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const player = createAudioPlayer();
 
 const TEMP_USER_AUDIO = path.resolve('./temp_user.wav');
 
-// --- 3. スラッシュコマンド登録 ---
+// --- 3. スラッシュコマンド定義 ---
 const commands = [
     new SlashCommandBuilder().setName('join').setDescription('VCに参加してGemini AIと会話を開始します'),
     new SlashCommandBuilder().setName('leave').setDescription('VCから退室します')
@@ -50,8 +49,14 @@ client.once('ready', async () => {
     console.log(`✅ ログイン完了: ${client.user.tag}`);
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
-        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('✅ スラッシュコマンド登録完了');
+        const guilds = client.guilds.cache.map(g => g.id);
+        for (const guildId of guilds) {
+            await rest.put(
+                Routes.applicationGuildCommands(client.user.id, guildId),
+                { body: commands }
+            );
+        }
+        console.log(`⚡ 全 ${guilds.length} 個のサーバーにスラッシュコマンドを【即時同期】しました！`);
     } catch (error) {
         console.error('❌ コマンド登録エラー:', error);
     }
@@ -75,7 +80,7 @@ client.on('interactionCreate', async (interaction) => {
             channelId: voiceChannel.id,
             guildId: guild.id,
             adapterCreator: guild.voiceAdapterCreator,
-            selfDeaf: false,
+            selfDeaf: false, // ユーザーの声を聞くため無効化
             selfMute: false
         });
 
@@ -96,17 +101,22 @@ client.on('interactionCreate', async (interaction) => {
     }
 });
 
-// --- 5. 音声自動検知（ハンズフリー会話） ---
+// --- 5. 音声自動検知（ログ強化版） ---
 function setupSpeechRecognition(connection) {
     const receiver = connection.receiver;
 
     receiver.speaking.on('start', (userId) => {
-        if (player.state.status === AudioPlayerStatus.Playing) return;
+        console.log(`🎤 発話を検知しました (User: ${userId})`);
+
+        if (player.state.status === AudioPlayerStatus.Playing) {
+            console.log('⏩ AI再生中のためスキップします');
+            return;
+        }
 
         const opusStream = receiver.subscribe(userId, {
             end: {
                 behavior: EndBehaviorType.AfterSilence,
-                duration: 800
+                duration: 1000 // 1秒の無音で発話終了判定
             }
         });
 
@@ -116,6 +126,7 @@ function setupSpeechRecognition(connection) {
         opusStream.pipe(decoder).pipe(wavStream);
 
         wavStream.on('finish', async () => {
+            console.log('🎙️ 音声録音完了。Geminiへ送信中...');
             await processGeminiAIResponse();
         });
     });
@@ -124,7 +135,18 @@ function setupSpeechRecognition(connection) {
 // --- 6. Gemini 思考 ➔ 音声再生 ---
 async function processGeminiAIResponse() {
     try {
-        if (!fs.existsSync(TEMP_USER_AUDIO) || fs.statSync(TEMP_USER_AUDIO).size < 2000) return;
+        if (!fs.existsSync(TEMP_USER_AUDIO)) {
+            console.log('⚠️ 音声ファイルが存在しません');
+            return;
+        }
+
+        const stats = fs.statSync(TEMP_USER_AUDIO);
+        console.log(`📁 録音ファイルサイズ: ${stats.size} bytes`);
+
+        if (stats.size < 3000) {
+            console.log('⚠️ 音声データが小さすぎるため（短すぎる/雑音）処理をスキップします');
+            return;
+        }
 
         const audioBuffer = fs.readFileSync(TEMP_USER_AUDIO);
         const base64Audio = audioBuffer.toString('base64');
@@ -142,9 +164,12 @@ async function processGeminiAIResponse() {
         ]);
 
         const aiText = response.response.text().trim();
-        if (!aiText) return;
+        if (!aiText) {
+            console.log('⚠️ Geminiからの返答テキストが空でした');
+            return;
+        }
 
-        console.log(`🤖 Gemini: "${aiText}"`);
+        console.log(`🤖 Geminiの回答: "${aiText}"`);
 
         const ttsUrl = googleTTS.getAudioUrl(aiText, {
             lang: 'ja',
